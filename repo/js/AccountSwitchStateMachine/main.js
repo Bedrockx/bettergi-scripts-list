@@ -93,7 +93,8 @@ let gameRegion = null;
                     
                     // 检查当前界面是否存在目标账号图片（适用于只有一个账号的情况）
                     log.info(`尝试在 enterGame 状态查找账号图片：${accountImagePath}`);
-                    const uidFoundInEnterGame = await findAndClickByMat(accountImageMat, false, 1000);
+                    const accountRo = RecognitionObject.TemplateMatch(accountImageMat, 0, 0, 1920, 1080);
+                    const uidFoundInEnterGame = await findAndClick(accountRo, false, 1000);
                     
                     if (uidFoundInEnterGame) {
                         log.info(`在 enterGame 状态找到账号图片：${settings.targetUid}.png`);
@@ -125,7 +126,8 @@ let gameRegion = null;
                             
                             // 使用预加载的图片模板进行查找
                             log.info(`尝试查找并点击账号图片：${accountImagePath}`);
-                            const uidFound = await findAndClickByMat(accountImageMat, true, 5000);
+                            const accountRo = RecognitionObject.TemplateMatch(accountImageMat, 0, 0, 1920, 1080);
+                            const uidFound = await findAndClick(accountRo, true, 5000);
                             
                             if (uidFound) {
                                 log.info(`成功点击账号图片：${settings.targetUid}.png`);
@@ -208,9 +210,18 @@ let gameRegion = null;
                                 file.ReadImageMatSync('assets/RecognitionObjects/EnterAccount.png'),
                                 0, 0, 1920, 1080
                             );
-                            const tempRegion = captureGameRegion();
-                            accountInputFound = tempRegion.find(checkRo).isExist();
-                            tempRegion.dispose();
+                            let tempRegion = null;
+                            try {
+                                tempRegion = captureGameRegion();
+                                accountInputFound = tempRegion.find(checkRo).isExist();
+                            } catch (e) {
+                                log.error(`检查账号输入框时出错：${e.message}`);
+                                accountInputFound = false;
+                            } finally {
+                                if (tempRegion) {
+                                    tempRegion.dispose();
+                                }
+                            }
                             if (accountInputFound) {
                                 log.warn('账号输入框仍然存在，可能输入失败，重试');
                             } else {
@@ -238,9 +249,18 @@ let gameRegion = null;
                                 file.ReadImageMatSync('assets/RecognitionObjects/EnterPassword.png'),
                                 0, 0, 1920, 1080
                             );
-                            const tempRegion = captureGameRegion();
-                            passwordInputFound = tempRegion.find(checkRo).isExist();
-                            tempRegion.dispose();
+                            let tempRegion = null;
+                            try {
+                                tempRegion = captureGameRegion();
+                                passwordInputFound = tempRegion.find(checkRo).isExist();
+                            } catch (e) {
+                                log.error(`检查密码输入框时出错：${e.message}`);
+                                passwordInputFound = false;
+                            } finally {
+                                if (tempRegion) {
+                                    tempRegion.dispose();
+                                }
+                            }
                             if (passwordInputFound) {
                                 log.warn('密码输入框仍然存在，可能输入失败，重试');
                             } else {
@@ -348,39 +368,33 @@ async function determineCurrentState(previousState = null) {
 
     // 最多尝试3次
     const maxAttempts = 30;
+    let currentMousePos = null; // 保存当前鼠标位置，初始为空表示未知
+    
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        // 释放之前的gameRegion
-        if (gameRegion) {
-            gameRegion.dispose();
-            gameRegion = null;
-        }
-        
-        // 捕获游戏画面并使用try-finally确保释放
-        gameRegion = captureGameRegion();
         try {
             // 遍历所有状态进行匹配
             for (const stateName of stateSequence) {
                 const state = stateMachineConfig[stateName];
                 if (!state || !state.detection) continue;
 
-                // 评估该状态的检测条件
-                if (await evaluateDetectionConditions(state.detection)) {
+                // 评估该状态的检测条件，传入当前鼠标位置
+                const result = await evaluateDetectionConditions(state.detection, currentMousePos);
+                if (result.isMatch) {
                     return stateName;
                 }
+                // 更新鼠标位置
+                currentMousePos = result.mousePos;
             }
+        } catch (e) {
+            log.error(`识别状态时出错：${e.message}`);
+        }
 
-            if (attempt < maxAttempts) {
-                log.warn(`第 ${attempt} 次尝试未识别到当前状态，1秒后重试...`);
-                await sleep(1000);
-            }
-        } finally {
-            // 统一释放gameRegion
-            if (gameRegion) {
-                gameRegion.dispose();
-                gameRegion = null;
-            }
+        if (attempt < maxAttempts) {
+            log.warn(`第 ${attempt} 次尝试未识别到当前状态，1秒后重试...`);
+            await sleep(1000);
         }
     }
+
     log.error(`经过 ${maxAttempts} 次尝试仍无法识别当前状态`);
     return null;
 }
@@ -463,54 +477,139 @@ function buildBFSSequence(previousState = null) {
  * @param {Object} detection - 检测配置对象，包含conditions数组和logic表达式
  * @returns {boolean} 是否匹配该状态
  */
-async function evaluateDetectionConditions(detection) {
+async function evaluateDetectionConditions(detection, currentMousePos) {
     if (!detection || !detection.conditions || detection.conditions.length === 0) {
-        return false;
+        return { isMatch: false, mousePos: currentMousePos };
     }
 
-    // 计算每个条件的值
-    const conditionValues = {};
-
-    for (const condition of detection.conditions) {
-        const { id, template, region } = condition;
-
-        // 移动鼠标到安全位置（避免遮挡识别区域）
-        const safeX = 10;
-        const safeY = 10;
-        moveMouseTo(safeX, safeY);
-        await sleep(50);
-
-        // 创建识别对象
-        const templatePath = template;
-        const ro = RecognitionObject.TemplateMatch(
-            file.ReadImageMatSync(templatePath),
-            region.x, region.y, region.width, region.height
-        );
-
-        // 执行识别
-        const result = gameRegion.find(ro);
-        conditionValues[id] = result.isExist();
-
-
+    // 检查鼠标位置是否需要移动
+    let newMousePos = currentMousePos;
+    
+    // 检查当前鼠标位置是否离所有识别区域均超过50x50
+    const isMouseSafe = checkMousePosition(currentMousePos, detection.conditions);
+    
+    if (!isMouseSafe) {
+        // 寻找合适的鼠标位置
+        newMousePos = findSafeMousePosition(detection.conditions);
+        if (newMousePos) {
+            moveMouseTo(newMousePos.x, newMousePos.y);
+            await sleep(50);
+        } else {
+            // 没有找到合适的位置，移动到默认位置
+            moveMouseTo(10, 10);
+            await sleep(50);
+            newMousePos = { x: 10, y: 10 };
+        }
     }
 
-    // 使用logic表达式计算最终结果
-    // 将logic表达式中的条件ID替换为实际值
-    let logicExpression = detection.logic;
-    for (const [key, value] of Object.entries(conditionValues)) {
-        // 使用正则替换完整的条件名，避免部分匹配
-        const regex = new RegExp(`\\b${key}\\b`, 'g');
-        logicExpression = logicExpression.replace(regex, value);
+    // 先检查并释放gameRegion
+    if (gameRegion) {
+        gameRegion.dispose();
     }
+    
+    // 捕获游戏画面
+    gameRegion = captureGameRegion();
 
-    // 计算逻辑表达式
     try {
-        const result = eval(logicExpression);
-        return result;
+        // 计算每个条件的值
+        const conditionValues = {};
+
+        for (const condition of detection.conditions) {
+            const { id, template, region } = condition;
+
+            // 创建识别对象
+            const templatePath = template;
+            const ro = RecognitionObject.TemplateMatch(
+                file.ReadImageMatSync(templatePath),
+                region.x, region.y, region.width, region.height
+            );
+
+            // 执行识别
+            const result = gameRegion.find(ro);
+            conditionValues[id] = result.isExist();
+        }
+
+        // 使用logic表达式计算最终结果
+        // 将logic表达式中的条件ID替换为实际值
+        let logicExpression = detection.logic;
+        for (const [key, value] of Object.entries(conditionValues)) {
+            // 使用正则替换完整的条件名，避免部分匹配
+            const regex = new RegExp(`\\b${key}\\b`, 'g');
+            logicExpression = logicExpression.replace(regex, value);
+        }
+
+        // 计算逻辑表达式
+        try {
+            const isMatch = eval(logicExpression);
+            return { isMatch, mousePos: newMousePos };
+        } catch (e) {
+            log.error(`逻辑表达式计算失败: ${detection.logic} -> ${logicExpression}, 错误: ${e.message}`);
+            return { isMatch: false, mousePos: newMousePos };
+        }
     } catch (e) {
-        log.error(`逻辑表达式计算失败: ${detection.logic} -> ${logicExpression}, 错误: ${e.message}`);
-        return false;
+        log.error(`评估检测条件时出错：${e.message}`);
+        return { isMatch: false, mousePos: newMousePos };
+    } finally {
+        if (gameRegion) {
+            gameRegion.dispose();
+        }
     }
+}
+
+/**
+ * 检查鼠标位置是否离所有识别区域均超过50x50
+ * @param {Object|null} mousePos - 当前鼠标位置 {x, y}
+ * @param {Array} conditions - 检测条件数组
+ * @returns {boolean} 是否安全
+ */
+function checkMousePosition(mousePos, conditions) {
+    if (!mousePos) {
+        return false; // 未知位置，认为不安全
+    }
+    
+    for (const condition of conditions) {
+        const { region } = condition;
+        const { x, y, width, height } = region;
+        
+        // 检查鼠标是否在识别区域附近50像素内
+        if (mousePos.x >= x - 50 && mousePos.x <= x + width + 50 &&
+            mousePos.y >= y - 50 && mousePos.y <= y + height + 50) {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+/**
+ * 在10x10到1910x1070间隔10x10的点阵中寻找安全的鼠标位置
+ * @param {Array} conditions - 检测条件数组
+ * @returns {Object|null} 安全的鼠标位置 {x, y}，如果没有找到返回null
+ */
+function findSafeMousePosition(conditions) {
+    for (let x = 10; x <= 1910; x += 10) {
+        for (let y = 10; y <= 1070; y += 10) {
+            let isSafe = true;
+            
+            for (const condition of conditions) {
+                const { region } = condition;
+                const { x: rx, y: ry, width, height } = region;
+                
+                // 检查该点是否在识别区域附近50像素内
+                if (x >= rx - 50 && x <= rx + width + 50 &&
+                    y >= ry - 50 && y <= ry + height + 50) {
+                    isSafe = false;
+                    break;
+                }
+            }
+            
+            if (isSafe) {
+                return { x, y };
+            }
+        }
+    }
+    
+    return null; // 没有找到安全位置
 }
 
 /**
@@ -721,29 +820,9 @@ async function findAndClick(target,
         return retType === 0 ? false : null;
     }
 }
-// 将函数挂载到 globalThis，供 new Function 创建的作用域访问
-globalThis.findAndClick = findAndClick;
 
-/**
- * 使用预加载的图片矩阵查找并点击
- * 避免重复加载图片，提高性能
- *
- * @param {Mat} imageMat - 预加载的图片矩阵
- * @param {boolean} click - 是否点击，默认为true
- * @param {number} timeout - 超时时间（毫秒），默认30000
- * @returns {boolean} 是否找到并点击
- */
-async function findAndClickByMat(imageMat, click = true, timeout = 30000) {
-    // 创建识别对象
-    const ro = RecognitionObject.TemplateMatch(
-        imageMat,
-        0, 0, 1920, 1080
-    );
-    // 调用通用findAndClick函数
-    return await findAndClick(ro, click, timeout, 200);
-}
 // 将函数挂载到 globalThis，供 new Function 创建的作用域访问
-globalThis.findAndClickByMat = findAndClickByMat;
+//globalThis.findAndClick = findAndClick;
 
 /**
  * 数字模板匹配
@@ -1001,14 +1080,14 @@ async function handleScreenshotMode() {
         const CAP_W = 150;
         const CAP_H = 27;
         
+        // 保存路径
+        const TARGET_DIR = 'accounts';
+        const fullPath = TARGET_DIR + '/' + uidStr + '.png';
+        
         // 捕获游戏画面
         gameRegion = captureGameRegion();
         try {
             const mat = gameRegion.DeriveCrop(CAP_X, CAP_Y, CAP_W, CAP_H).SrcMat;
-            
-            // 保存路径
-            const TARGET_DIR = 'accounts';
-            const fullPath = TARGET_DIR + '/' + uidStr + '.png';
             
             // 保存图片
             file.WriteImageSync(fullPath, mat);
